@@ -1,0 +1,11 @@
+[project]
+name = "ctrob-timelapse"
+version = "1.0.0"
+description = "Organizador de fotos timelapse de cartão SD"
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.7",
+]
+
+[project.scripts]
+ctrob-timelapse = "main:main"
