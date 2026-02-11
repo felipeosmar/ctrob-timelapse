@@ -4,7 +4,7 @@ echo  CTROB Timelapse - Build Windows
 echo ========================================
 echo.
 
-pip install PySide6 pyinstaller
+pip install PyQt5 pyinstaller
 if errorlevel 1 (
     echo ERRO: Falha ao instalar dependencias. Verifique se o Python esta no PATH.
     pause

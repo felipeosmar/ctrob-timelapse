@@ -19,8 +19,8 @@ import sys
 import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal, QObject
-from PySide6.QtWidgets import (
+from PyQt5.QtCore import Qt, pyqtSignal, QObject
+from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
     QFileDialog,
@@ -42,9 +42,9 @@ from PySide6.QtWidgets import (
 class CopyWorker(QObject):
     """Worker que executa a cópia em thread separada."""
 
-    progress = Signal(int, int, str)  # current, total, filename
-    finished = Signal(int, int)  # copied, errors
-    error = Signal(str)
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(int, int)
+    error = pyqtSignal(str)
 
     def __init__(self, source: Path, destination: Path):
         super().__init__()
@@ -88,14 +88,14 @@ class CopyWorker(QObject):
         except Exception as e:
             self.error.emit(str(e))
 
-    def _scan_photos(self) -> list[tuple[Path, str]]:
+    def _scan_photos(self) -> list:
         """
         Varre a árvore do SD e retorna lista de (caminho_original, novo_nome).
 
         Estrutura: {data}/{???}/jpg/{hora}/{arquivo}.jpg
         Resultado: {data}_{seq:03d}.jpg
         """
-        photos: list[tuple[Path, str]] = []
+        photos = []
 
         date_dirs = sorted(
             d
@@ -120,9 +120,9 @@ class CopyWorker(QObject):
 class TimelapseWorker(QObject):
     """Worker que gera o vídeo timelapse via ffmpeg."""
 
-    progress = Signal(int, int, str)  # current, total, msg
-    finished = Signal(str)  # output path
-    error = Signal(str)
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
 
     def __init__(
         self,
@@ -143,7 +143,6 @@ class TimelapseWorker(QObject):
 
     def run(self):
         try:
-            # Listar fotos em ordem
             photos = sorted(self.photos_dir.glob("*.jpg"))
             if not photos:
                 self.error.emit("Nenhuma foto encontrada na pasta destino.")
@@ -152,18 +151,15 @@ class TimelapseWorker(QObject):
             total = len(photos)
             self.progress.emit(0, total, f"Preparando {total} fotos...")
 
-            # Criar arquivo de lista para ffmpeg concat
             list_file = self.photos_dir / "_ffmpeg_list.txt"
             with open(list_file, "w") as f:
                 for photo in photos:
                     f.write(f"file '{photo.name}'\n")
                     f.write(f"duration {1/self.fps:.6f}\n")
-                # Repetir última para duração correta
                 f.write(f"file '{photos[-1].name}'\n")
 
             self.progress.emit(0, total, "Gerando vídeo com ffmpeg...")
 
-            # Executar ffmpeg
             w, h = self.resolution.split("x")
             vf = (
                 f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
@@ -191,10 +187,12 @@ class TimelapseWorker(QObject):
                 "23",
                 "-r",
                 str(self.fps),
+                "-progress",
+                "pipe:1",
+                "-stats_period",
+                "0.5",
                 str(self.output_path),
             ]
-
-            cmd.extend(["-progress", "pipe:1", "-stats_period", "0.5"])
 
             process = subprocess.Popen(
                 cmd,
@@ -203,9 +201,7 @@ class TimelapseWorker(QObject):
                 cwd=str(self.photos_dir),
             )
 
-            # Monitorar progresso via stdout (-progress pipe:1)
             stderr_data = []
-            current_frame = 0
 
             def _read_stderr():
                 for line in iter(process.stderr.readline, b""):
@@ -234,7 +230,6 @@ class TimelapseWorker(QObject):
             process.wait()
             stderr_thread.join(timeout=2)
 
-            # Limpar arquivo temporário
             list_file.unlink(missing_ok=True)
 
             if self._cancel:
@@ -259,7 +254,8 @@ class TimelapseWorker(QObject):
 
         except FileNotFoundError:
             self.error.emit(
-                "ffmpeg não encontrado. Instale com: sudo apt install ffmpeg"
+                "ffmpeg não encontrado. Instale com: sudo apt install ffmpeg\n"
+                "No Windows: winget install ffmpeg"
             )
         except Exception as e:
             self.error.emit(str(e))
@@ -386,11 +382,9 @@ class MainWindow(QMainWindow):
 
         # === Rodapé ===
         lbl_footer = QLabel("Criado por Felipe O. de Aviz (felipe.aviz@sc.senai.br)")
-        lbl_footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_footer.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        lbl_footer.setCursor(Qt.CursorShape.IBeamCursor)
+        lbl_footer.setAlignment(Qt.AlignCenter)
+        lbl_footer.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lbl_footer.setCursor(Qt.IBeamCursor)
         lbl_footer.setStyleSheet("color: #999; font-size: 11px; margin-top: 4px;")
         layout.addWidget(lbl_footer)
 
@@ -481,7 +475,7 @@ class MainWindow(QMainWindow):
 
     def _on_copy_finished(self, copied: int, errors: int):
         self._set_buttons_busy(False)
-        msg = f"✅ Cópia concluída! {copied} fotos copiadas"
+        msg = f"✅ Concluído! {copied} fotos copiadas"
         if errors:
             msg += f", {errors} erros"
         self.lbl_status.setText(msg)
@@ -505,7 +499,7 @@ def main():
     app.setStyle("Fusion")
     window = MainWindow()
     window.show()
-    sys.exit(app.exec())
+    sys.exit(app.exec_())
 
 
 if __name__ == "__main__":

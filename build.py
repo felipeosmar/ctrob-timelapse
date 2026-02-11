@@ -43,10 +43,6 @@ def main():
 
     mode = "--onefile" if "--onefile" in sys.argv else "--onedir"
 
-    # Coletar path das DLLs do PySide6
-    import PySide6
-    pyside6_dir = os.path.dirname(PySide6.__file__)
-
     cmd = [
         sys.executable,
         "-m",
@@ -56,10 +52,9 @@ def main():
         "--windowed",
         "--noconfirm",
         "--clean",
-        "--hidden-import=PySide6.QtCore",
-        "--hidden-import=PySide6.QtGui",
-        "--hidden-import=PySide6.QtWidgets",
-        f"--add-data={pyside6_dir}{os.pathsep}PySide6",
+        "--hidden-import=PyQt5.QtCore",
+        "--hidden-import=PyQt5.QtGui",
+        "--hidden-import=PyQt5.QtWidgets",
         "main.py",
     ]
 
