@@ -42,9 +42,13 @@ from PyQt5.QtWidgets import (
 HAS_OCR = True
 try:
     import importlib
-    importlib.import_module("pytesseract")
     importlib.import_module("PIL")
-except ImportError:
+    # Check for at least one OCR backend
+    _has_easyocr = bool(importlib.util.find_spec("easyocr"))
+    _has_tesseract = bool(importlib.util.find_spec("pytesseract"))
+    if not _has_easyocr and not _has_tesseract:
+        HAS_OCR = False
+except Exception:
     HAS_OCR = False
 
 
@@ -271,57 +275,172 @@ class TimelapseWorker(QObject):
 
 
 class OcrRenameWorker(QObject):
-    """Worker que renomeia fotos baseado em OCR da data no canto superior direito."""
+    """Worker que renomeia fotos baseado em OCR da data no canto superior direito.
+
+    Usa EasyOCR (deep learning, melhor com fundos variados) como backend
+    principal, com fallback para Tesseract. Parsing robusto corrige
+    erros comuns de OCR em timestamps de câmera.
+    """
 
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(int, int, int)  # renamed, errors, skipped
     error = pyqtSignal(str)
 
-    # Regex para data no formato DD-MM-YYYY HH:MM:SS
-    DATE_PATTERN = re.compile(
-        r"(\d{2})[/-](\d{2})[/-](\d{4})\s+(\d{2})[:\.](\d{2})[:\.](\d{2})"
-    )
+    DATE_PART = re.compile(r"(\d{1,2})[/-](\d{2})[/-](\d{4})")
+    TIME_PART = re.compile(r"(\d{2})[:\.](\d{2})[:\.](\d{2})")
 
     def __init__(self, folder: Path, dry_run: bool = False):
         super().__init__()
         self.folder = folder
         self.dry_run = dry_run
         self._cancel = False
+        self._easyocr_reader = None
 
     def cancel(self):
         self._cancel = True
 
-    def _extract_date_from_image(self, img_path: Path) -> str | None:
-        """Extrai data/hora do canto superior direito da imagem via OCR."""
+    @staticmethod
+    def _clean_ocr(text: str) -> str:
+        """Corrige substituições comuns de OCR."""
+        replacements = {
+            "Q": "0", "O": "0", "o": "0",
+            "b": "8", "B": "8",
+            "l": "1", "I": "1",
+            "Z": "2", "z": "2",
+            "S": "5", "s": "5",
+            "G": "6", "g": "9",
+        }
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+        return text
+
+    def _parse_datetime(self, raw_text: str) -> str | None:
+        """Extrai data/hora de texto OCR com parsing tolerante a erros."""
+        text = self._clean_ocr(raw_text)
+
+        # Remove caracteres não-relevantes para facilitar o parsing
+        cleaned = re.sub(r"[^0-9/\-:. ]", "", text)
+
+        dm = self.DATE_PART.search(cleaned)
+        if not dm:
+            return None
+
+        d, m, y = dm.groups()
+        d = d.zfill(2)
+
+        # Validar data
+        if not (1 <= int(d) <= 31 and 1 <= int(m) <= 12 and 2020 <= int(y) <= 2030):
+            return None
+
+        # Buscar hora após a data
+        rest = cleaned[dm.end():]
+        tm = self.TIME_PART.search(rest)
+        if tm:
+            H, M, S = tm.groups()
+            if int(H) > 23:
+                return None
+        else:
+            # Tentar extrair pelo menos a hora
+            hm = re.search(r"(\d{2})", rest)
+            if hm and int(hm.group(1)) <= 23:
+                H = hm.group(1)
+            else:
+                H = "00"
+            M, S = "00", "00"
+
+        return f"{y}-{m}-{d}_{H}-{M}-{S}"
+
+    def _crop_timestamp_region(self, img_path: Path):
+        """Recorta a região do timestamp (canto superior direito)."""
         from PIL import Image
-        import pytesseract
 
         img = Image.open(img_path)
         w, h = img.size
+        crop = img.crop((int(w * 0.55), 0, w, int(h * 0.10)))
+        return crop
 
-        # Crop: canto superior direito (~45% largura, ~10% altura)
-        crop_box = (int(w * 0.55), 0, w, int(h * 0.10))
-        crop = img.crop(crop_box)
+    def _try_easyocr(self, crop) -> str | None:
+        """Tenta OCR com EasyOCR (deep learning)."""
+        try:
+            import easyocr
+        except ImportError:
+            return None
 
-        # Converter para escala de cinza
-        crop = crop.convert("L")
+        if self._easyocr_reader is None:
+            self._easyocr_reader = easyocr.Reader(
+                ["en"], gpu=True, verbose=False
+            )
 
-        # Threshold 180: texto branco em fundo escuro
-        crop = crop.point(lambda x: 255 if x > 180 else 0)
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+            crop.save(f.name)
+            results = self._easyocr_reader.readtext(f.name, detail=0)
+            Path(f.name).unlink(missing_ok=True)
 
-        # Escalar 3x para melhor OCR
-        crop = crop.resize((crop.width * 3, crop.height * 3), Image.LANCZOS)
+        raw = " ".join(results).strip()
+        return self._parse_datetime(raw)
 
-        # OCR com config otimizada para dígitos e separadores
-        text = pytesseract.image_to_string(
-            crop,
-            config="--psm 7 -c tessedit_char_whitelist=0123456789-/.: ",
-        ).strip()
+    def _try_tesseract(self, crop) -> str | None:
+        """Tenta OCR com Tesseract (múltiplas estratégias de threshold)."""
+        try:
+            import pytesseract
+            from PIL import ImageOps
+        except ImportError:
+            return None
 
-        match = self.DATE_PATTERN.search(text)
-        if match:
-            day, month, year, hour, minute, second = match.groups()
-            return f"{year}-{month}-{day}_{hour}-{minute}-{second}"
+        gray = crop.convert("L")
+
+        strategies = []
+        # Threshold direto (funciona para fundo escuro / noturno)
+        for thresh in [170, 180, 190]:
+            binary = gray.point(lambda x, t=thresh: 255 if x > t else 0)
+            strategies.append(binary)
+
+        # Autocontrast (funciona para amanhecer/entardecer)
+        for cutoff in [5, 10]:
+            enhanced = ImageOps.autocontrast(gray, cutoff=cutoff)
+            for thresh in [200, 220]:
+                binary = enhanced.point(lambda x, t=thresh: 255 if x > t else 0)
+                strategies.append(binary)
+
+        for binary in strategies:
+            scaled = binary.resize(
+                (binary.width * 3, binary.height * 3),
+                crop.resize.__func__  # LANCZOS
+                if not hasattr(crop, "Resampling")
+                else None,
+            )
+            try:
+                from PIL import Image
+                scaled = binary.resize(
+                    (binary.width * 3, binary.height * 3), Image.LANCZOS
+                )
+                text = pytesseract.image_to_string(
+                    scaled,
+                    config="--psm 7 -c tessedit_char_whitelist=0123456789-/.: ",
+                ).strip()
+            except Exception:
+                continue
+
+            result = self._parse_datetime(text)
+            if result:
+                return result
+
+        return None
+
+    def _extract_date_from_image(self, img_path: Path) -> str | None:
+        """Extrai data/hora usando EasyOCR com fallback para Tesseract."""
+        crop = self._crop_timestamp_region(img_path)
+
+        # Tentar EasyOCR primeiro (melhor com fundos variados)
+        result = self._try_easyocr(crop)
+        if result:
+            return result
+
+        # Fallback: Tesseract com múltiplos thresholds
+        result = self._try_tesseract(crop)
+        if result:
+            return result
 
         return None
 
@@ -329,8 +448,8 @@ class OcrRenameWorker(QObject):
         if not HAS_OCR:
             self.error.emit(
                 "Dependências de OCR não instaladas.\n"
-                "Instale com: pip install pytesseract Pillow\n"
-                "E instale o Tesseract: sudo apt install tesseract-ocr"
+                "Instale com: pip install easyocr Pillow\n"
+                "Ou: pip install pytesseract Pillow + apt install tesseract-ocr"
             )
             return
 
@@ -362,8 +481,6 @@ class OcrRenameWorker(QObject):
                         self.progress.emit(
                             i + 1, total, f"⚠ Sem data: {photo.name}"
                         )
-
-                        # Mover para subpasta _nao_identificados
                         if not self.dry_run:
                             no_id_dir = self.folder / "_nao_identificados"
                             no_id_dir.mkdir(exist_ok=True)
@@ -373,7 +490,6 @@ class OcrRenameWorker(QObject):
                     new_name = f"{date_str}{photo.suffix.lower()}"
                     new_path = self.folder / new_name
 
-                    # Evitar sobrescrever
                     counter = 1
                     while new_path.exists():
                         new_name = f"{date_str}_{counter:02d}{photo.suffix.lower()}"
