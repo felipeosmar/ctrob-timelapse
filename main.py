@@ -411,10 +411,14 @@ class OcrRenameWorker(QObject):
     def _get_preprocessed_crops(self, crop):
         """Gera múltiplas versões pré-processadas do crop para OCR.
 
-        Retorna lista de (nome, imagem) com diferentes estratégias:
+        Retorna lista de (nome, imagem) com diferentes estratégias,
+        ordenadas por eficácia empírica:
         - raw: imagem original (funciona bem para noturnas/nublado)
         - clahe: equalização adaptativa de histograma (melhora contraste local)
         - contrast: alto contraste (ajuda com texto desbotado)
+        - sat_v_combo: HSV low-sat + high-value (isola texto branco de céu azul)
+        - clahe8/16: CLAHE agressivo (recupera texto em fundos claros/cinza)
+        - adaptive: threshold adaptativo gaussiano
         """
         try:
             import cv2
@@ -423,18 +427,47 @@ class OcrRenameWorker(QObject):
         except ImportError:
             return [("raw", crop)]
 
+        from PIL import Image
+
         preprocessed = [("raw", crop)]
 
+        img_cv = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+
         # CLAHE — equalização adaptativa de histograma
-        gray = np.array(crop.convert("L"))
         clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
         cl = clahe.apply(gray)
-        from PIL import Image
         preprocessed.append(("clahe", Image.fromarray(cl)))
 
         # Alto contraste
         enhanced = ImageEnhance.Contrast(crop).enhance(3.0)
         preprocessed.append(("contrast", enhanced))
+
+        # HSV: low saturation + high value (isola texto branco de céu azul)
+        hsv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2HSV)
+        s_chan, v_chan = hsv[:, :, 1], hsv[:, :, 2]
+        _, s_inv = cv2.threshold(s_chan, 30, 255, cv2.THRESH_BINARY_INV)
+        _, v_high = cv2.threshold(v_chan, 220, 255, cv2.THRESH_BINARY)
+        sat_v = cv2.bitwise_and(s_inv, v_high)
+        preprocessed.append(("sat_v_combo", Image.fromarray(sat_v)))
+
+        # CLAHE agressivo (clipLimit=8, tileGrid=4x4) — recupera texto
+        # branco sobre fundos claros/cinza com baixo contraste
+        clahe8 = cv2.createCLAHE(clipLimit=8.0, tileGridSize=(4, 4))
+        cl8 = clahe8.apply(gray)
+        preprocessed.append(("clahe8", Image.fromarray(cl8)))
+
+        # CLAHE muito agressivo (clipLimit=16)
+        clahe16 = cv2.createCLAHE(clipLimit=16.0, tileGridSize=(4, 4))
+        cl16 = clahe16.apply(gray)
+        preprocessed.append(("clahe16", Image.fromarray(cl16)))
+
+        # Adaptive threshold gaussiano
+        adapt = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY, 21, -8,
+        )
+        preprocessed.append(("adaptive", Image.fromarray(adapt)))
 
         return preprocessed
 
@@ -466,43 +499,86 @@ class OcrRenameWorker(QObject):
         return None
 
     def _try_tesseract(self, crop) -> str | None:
-        """Tenta OCR com Tesseract (múltiplas estratégias de threshold)."""
+        """Tenta OCR com Tesseract (múltiplas estratégias de pré-processamento).
+
+        Pipeline completo:
+        1. Threshold direto em grayscale (noturnas/nublado)
+        2. HSV sat_v_combo (texto branco sobre céu azul)
+        3. CLAHE agressivo (texto sobre fundos claros)
+        4. Adaptive threshold (casos extremos)
+        5. Autocontrast (amanhecer/entardecer)
+        Cada estratégia é testada com PSM 7 (single line) e PSM 6 (block).
+        """
         try:
             import pytesseract
+            import cv2
+            import numpy as np
             from PIL import Image, ImageOps
         except ImportError:
             return None
 
-        gray = crop.convert("L")
+        WHITELIST = "-c tessedit_char_whitelist=0123456789-/.: "
 
-        strategies = []
-        # Threshold direto (funciona para fundo escuro / noturno)
+        gray = crop.convert("L")
+        gray_np = np.array(gray)
+
+        # --- Gerar todas as imagens binarizadas para OCR ---
+        strategies: list[tuple[str, Image.Image]] = []
+
+        # 1. Threshold direto (funciona para fundo escuro / noturno)
         for thresh in [170, 180, 190]:
             binary = gray.point(lambda x, t=thresh: 255 if x > t else 0)
-            strategies.append(binary)
+            strategies.append((f"gray_{thresh}", binary))
 
-        # Autocontrast (funciona para amanhecer/entardecer)
+        # 2. HSV: low saturation + high value (céu azul)
+        img_cv = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2BGR)
+        hsv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2HSV)
+        s_chan, v_chan = hsv[:, :, 1], hsv[:, :, 2]
+        _, s_inv = cv2.threshold(s_chan, 30, 255, cv2.THRESH_BINARY_INV)
+        _, v_high = cv2.threshold(v_chan, 220, 255, cv2.THRESH_BINARY)
+        sat_v = cv2.bitwise_and(s_inv, v_high)
+        strategies.append(("sat_v", Image.fromarray(sat_v)))
+
+        # 3. CLAHE agressivo + threshold alto
+        for clip, name in [(8.0, "clahe8"), (16.0, "clahe16")]:
+            clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(4, 4))
+            cl = clahe.apply(gray_np)
+            for t in [220, 240]:
+                _, ct = cv2.threshold(cl, t, 255, cv2.THRESH_BINARY)
+                strategies.append((f"{name}_{t}", Image.fromarray(ct)))
+
+        # 4. Adaptive threshold gaussiano
+        for bs, c in [(21, -5), (21, -8)]:
+            adapt = cv2.adaptiveThreshold(
+                gray_np, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, bs, c,
+            )
+            strategies.append((f"adapt_{bs}_{c}", Image.fromarray(adapt)))
+
+        # 5. Autocontrast (funciona para amanhecer/entardecer)
         for cutoff in [5, 10]:
             enhanced = ImageOps.autocontrast(gray, cutoff=cutoff)
             for thresh in [200, 220]:
                 binary = enhanced.point(lambda x, t=thresh: 255 if x > t else 0)
-                strategies.append(binary)
+                strategies.append((f"auto_{cutoff}_{thresh}", binary))
 
-        for binary in strategies:
-            try:
-                scaled = binary.resize(
-                    (binary.width * 3, binary.height * 3), Image.LANCZOS
-                )
-                text = pytesseract.image_to_string(
-                    scaled,
-                    config="--psm 7 -c tessedit_char_whitelist=0123456789-/.: ",
-                ).strip()
-            except Exception:
-                continue
+        # --- Testar cada estratégia com PSM 7 e PSM 6 ---
+        for _name, binary in strategies:
+            for psm in [7, 6]:
+                try:
+                    scaled = binary.resize(
+                        (binary.width * 3, binary.height * 3), Image.LANCZOS
+                    )
+                    text = pytesseract.image_to_string(
+                        scaled,
+                        config=f"--psm {psm} {WHITELIST}",
+                    ).strip()
+                except Exception:
+                    continue
 
-            result = self._parse_datetime(text)
-            if result:
-                return result
+                result = self._parse_datetime(text)
+                if result:
+                    return result
 
         return None
 
