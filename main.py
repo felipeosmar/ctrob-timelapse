@@ -280,14 +280,33 @@ class OcrRenameWorker(QObject):
     Usa EasyOCR (deep learning, melhor com fundos variados) como backend
     principal, com fallback para Tesseract. Parsing robusto corrige
     erros comuns de OCR em timestamps de câmera.
+
+    Múltiplos pré-processamentos (raw, CLAHE, alto contraste) são tentados
+    para lidar com fotos diurnas (texto branco sobre céu azul claro).
     """
 
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(int, int, int)  # renamed, errors, skipped
     error = pyqtSignal(str)
 
-    DATE_PART = re.compile(r"(\d{1,2})[/-](\d{2})[/-](\d{4})")
-    TIME_PART = re.compile(r"(\d{2})[:\.](\d{2})[:\.](\d{2})")
+    # Mapa extenso de substituições OCR (letras → dígitos mais prováveis)
+    _OCR_FIXES = {
+        "Q": "0", "O": "0", "o": "0", "D": "0", "U": "0", "C": "0",
+        "b": "8", "B": "8", "e": "8",
+        "l": "1", "I": "1", "i": "1", "J": "1", "r": "1", "t": "1",
+        "Z": "2", "z": "2",
+        "S": "5", "s": "5",
+        "G": "6", "g": "9",
+        "A": "4", "a": "4", "h": "4",
+        "T": "7", "n": "0", "p": "0", "d": "0",
+    }
+
+    # Padrões de data flexíveis (mês pode ter 1-3 dígitos por erro de OCR)
+    _DATE_PATTERNS = [
+        re.compile(r"(\d{1,2})[/-](\d{1,3})[/-](\d{4})"),
+        re.compile(r"(\d{1,2})\s+(\d{1,3})\s*[,.]?\s*(\d{4})"),
+        re.compile(r"(\d{1,2})\D+(\d{1,3})\D+(\d{4})"),
+    ]
 
     def __init__(self, folder: Path, dry_run: bool = False):
         super().__init__()
@@ -299,56 +318,86 @@ class OcrRenameWorker(QObject):
     def cancel(self):
         self._cancel = True
 
-    @staticmethod
-    def _clean_ocr(text: str) -> str:
+    @classmethod
+    def _clean_ocr(cls, text: str) -> str:
         """Corrige substituições comuns de OCR."""
-        replacements = {
-            "Q": "0", "O": "0", "o": "0",
-            "b": "8", "B": "8",
-            "l": "1", "I": "1",
-            "Z": "2", "z": "2",
-            "S": "5", "s": "5",
-            "G": "6", "g": "9",
-        }
-        for old, new in replacements.items():
+        for old, new in cls._OCR_FIXES.items():
             text = text.replace(old, new)
         return text
 
+    @staticmethod
+    def _fix_year(y_str: str) -> str | None:
+        """Corrige anos com primeiro dígito garbled (ex: 4025→2025)."""
+        y = int(y_str)
+        if 2020 <= y <= 2030:
+            return y_str
+        for fix in [f"2{y_str[1:]}", f"20{y_str[2:]}"]:
+            try:
+                if 2020 <= int(fix) <= 2030:
+                    return fix
+            except (ValueError, IndexError):
+                pass
+        return None
+
+    @staticmethod
+    def _extract_time_from_digits(d: str, m: str, y: str, digits: str) -> str:
+        """Extrai HH:MM:SS de uma sequência de dígitos via janela deslizante."""
+        # Tentar HHMMSS (6 dígitos)
+        if len(digits) >= 6:
+            for start in range(len(digits) - 5):
+                w = digits[start:start + 6]
+                hh, mm, ss = int(w[0:2]), int(w[2:4]), int(w[4:6])
+                if hh <= 23 and mm <= 59 and ss <= 59:
+                    return f"{y}-{m}-{d}_{hh:02d}-{mm:02d}-{ss:02d}"
+        # Tentar HHMM (4 dígitos)
+        if len(digits) >= 4:
+            for start in range(len(digits) - 3):
+                w = digits[start:start + 4]
+                hh, mm = int(w[0:2]), int(w[2:4])
+                if hh <= 23 and mm <= 59:
+                    return f"{y}-{m}-{d}_{hh:02d}-{mm:02d}-00"
+        # Tentar HH (2 dígitos)
+        if len(digits) >= 2:
+            hh = int(digits[0:2])
+            if hh <= 23:
+                return f"{y}-{m}-{d}_{hh:02d}-00-00"
+        return f"{y}-{m}-{d}_00-00-00"
+
     def _parse_datetime(self, raw_text: str) -> str | None:
-        """Extrai data/hora de texto OCR com parsing tolerante a erros."""
+        """Extrai data/hora de texto OCR com parsing tolerante a erros.
+
+        Suporta datas com mês de 1-3 dígitos (ex: 08, 8, 008),
+        anos com primeiro dígito errado (ex: 4025→2025),
+        e horas sem separadores claros (ex: '1300.04'→13:00:04).
+        """
         text = self._clean_ocr(raw_text)
+        cleaned = re.sub(r"[^0-9/\-:., ]", "", text)
 
-        # Remove caracteres não-relevantes para facilitar o parsing
-        cleaned = re.sub(r"[^0-9/\-:. ]", "", text)
+        for pat in self._DATE_PATTERNS:
+            for dm in pat.finditer(cleaned):
+                d, m, y = dm.groups()
 
-        dm = self.DATE_PART.search(cleaned)
-        if not dm:
-            return None
+                # Corrigir ano
+                y = self._fix_year(y)
+                if y is None:
+                    continue
 
-        d, m, y = dm.groups()
-        d = d.zfill(2)
+                # Corrigir mês com 3 dígitos (ex: 008→08, 031→01)
+                if len(m) == 3:
+                    for m_try in [m[1:], m[:2]]:
+                        if 1 <= int(m_try) <= 12:
+                            m = m_try
+                            break
 
-        # Validar data
-        if not (1 <= int(d) <= 31 and 1 <= int(m) <= 12 and 2020 <= int(y) <= 2030):
-            return None
+                d = d.zfill(2)
+                m = m.zfill(2)
 
-        # Buscar hora após a data
-        rest = cleaned[dm.end():]
-        tm = self.TIME_PART.search(rest)
-        if tm:
-            H, M, S = tm.groups()
-            if int(H) > 23:
-                return None
-        else:
-            # Tentar extrair pelo menos a hora
-            hm = re.search(r"(\d{2})", rest)
-            if hm and int(hm.group(1)) <= 23:
-                H = hm.group(1)
-            else:
-                H = "00"
-            M, S = "00", "00"
+                if 1 <= int(d) <= 31 and 1 <= int(m) <= 12:
+                    rest = cleaned[dm.end():]
+                    digits = re.sub(r"[^0-9]", "", rest)
+                    return self._extract_time_from_digits(d, m, y, digits)
 
-        return f"{y}-{m}-{d}_{H}-{M}-{S}"
+        return None
 
     def _crop_timestamp_region(self, img_path: Path):
         """Recorta a região do timestamp (canto superior direito)."""
@@ -359,8 +408,38 @@ class OcrRenameWorker(QObject):
         crop = img.crop((int(w * 0.55), 0, w, int(h * 0.10)))
         return crop
 
+    def _get_preprocessed_crops(self, crop):
+        """Gera múltiplas versões pré-processadas do crop para OCR.
+
+        Retorna lista de (nome, imagem) com diferentes estratégias:
+        - raw: imagem original (funciona bem para noturnas/nublado)
+        - clahe: equalização adaptativa de histograma (melhora contraste local)
+        - contrast: alto contraste (ajuda com texto desbotado)
+        """
+        try:
+            import cv2
+            import numpy as np
+            from PIL import ImageEnhance
+        except ImportError:
+            return [("raw", crop)]
+
+        preprocessed = [("raw", crop)]
+
+        # CLAHE — equalização adaptativa de histograma
+        gray = np.array(crop.convert("L"))
+        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+        cl = clahe.apply(gray)
+        from PIL import Image
+        preprocessed.append(("clahe", Image.fromarray(cl)))
+
+        # Alto contraste
+        enhanced = ImageEnhance.Contrast(crop).enhance(3.0)
+        preprocessed.append(("contrast", enhanced))
+
+        return preprocessed
+
     def _try_easyocr(self, crop) -> str | None:
-        """Tenta OCR com EasyOCR (deep learning)."""
+        """Tenta OCR com EasyOCR em múltiplos pré-processamentos."""
         try:
             import easyocr
         except ImportError:
@@ -372,19 +451,25 @@ class OcrRenameWorker(QObject):
             )
 
         import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-            crop.save(f.name)
-            results = self._easyocr_reader.readtext(f.name, detail=0)
-            Path(f.name).unlink(missing_ok=True)
 
-        raw = " ".join(results).strip()
-        return self._parse_datetime(raw)
+        for _name, img_proc in self._get_preprocessed_crops(crop):
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+                img_proc.save(f.name)
+                results = self._easyocr_reader.readtext(f.name, detail=0)
+                Path(f.name).unlink(missing_ok=True)
+
+            raw = " ".join(results).strip()
+            result = self._parse_datetime(raw)
+            if result:
+                return result
+
+        return None
 
     def _try_tesseract(self, crop) -> str | None:
         """Tenta OCR com Tesseract (múltiplas estratégias de threshold)."""
         try:
             import pytesseract
-            from PIL import ImageOps
+            from PIL import Image, ImageOps
         except ImportError:
             return None
 
@@ -404,14 +489,7 @@ class OcrRenameWorker(QObject):
                 strategies.append(binary)
 
         for binary in strategies:
-            scaled = binary.resize(
-                (binary.width * 3, binary.height * 3),
-                crop.resize.__func__  # LANCZOS
-                if not hasattr(crop, "Resampling")
-                else None,
-            )
             try:
-                from PIL import Image
                 scaled = binary.resize(
                     (binary.width * 3, binary.height * 3), Image.LANCZOS
                 )
