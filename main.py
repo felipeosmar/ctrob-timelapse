@@ -13,6 +13,7 @@ Resultado:
     {destino}/timelapse.mp4
 """
 
+import re
 import shutil
 import subprocess
 import sys
@@ -37,6 +38,14 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+HAS_OCR = True
+try:
+    import importlib
+    importlib.import_module("pytesseract")
+    importlib.import_module("PIL")
+except ImportError:
+    HAS_OCR = False
 
 
 class CopyWorker(QObject):
@@ -261,6 +270,137 @@ class TimelapseWorker(QObject):
             self.error.emit(str(e))
 
 
+class OcrRenameWorker(QObject):
+    """Worker que renomeia fotos baseado em OCR da data no canto superior direito."""
+
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(int, int, int)  # renamed, errors, skipped
+    error = pyqtSignal(str)
+
+    # Regex para data no formato DD-MM-YYYY HH:MM:SS
+    DATE_PATTERN = re.compile(
+        r"(\d{2})[/-](\d{2})[/-](\d{4})\s+(\d{2})[:\.](\d{2})[:\.](\d{2})"
+    )
+
+    def __init__(self, folder: Path, dry_run: bool = False):
+        super().__init__()
+        self.folder = folder
+        self.dry_run = dry_run
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def _extract_date_from_image(self, img_path: Path) -> str | None:
+        """Extrai data/hora do canto superior direito da imagem via OCR."""
+        from PIL import Image
+        import pytesseract
+
+        img = Image.open(img_path)
+        w, h = img.size
+
+        # Crop: canto superior direito (~45% largura, ~10% altura)
+        crop_box = (int(w * 0.55), 0, w, int(h * 0.10))
+        crop = img.crop(crop_box)
+
+        # Converter para escala de cinza
+        crop = crop.convert("L")
+
+        # Threshold 180: texto branco em fundo escuro
+        crop = crop.point(lambda x: 255 if x > 180 else 0)
+
+        # Escalar 3x para melhor OCR
+        crop = crop.resize((crop.width * 3, crop.height * 3), Image.LANCZOS)
+
+        # OCR com config otimizada para dígitos e separadores
+        text = pytesseract.image_to_string(
+            crop,
+            config="--psm 7 -c tessedit_char_whitelist=0123456789-/.: ",
+        ).strip()
+
+        match = self.DATE_PATTERN.search(text)
+        if match:
+            day, month, year, hour, minute, second = match.groups()
+            return f"{year}-{month}-{day}_{hour}-{minute}-{second}"
+
+        return None
+
+    def run(self):
+        if not HAS_OCR:
+            self.error.emit(
+                "Dependências de OCR não instaladas.\n"
+                "Instale com: pip install pytesseract Pillow\n"
+                "E instale o Tesseract: sudo apt install tesseract-ocr"
+            )
+            return
+
+        try:
+            photos = sorted(
+                f
+                for f in self.folder.iterdir()
+                if f.is_file() and f.suffix.lower() in (".jpg", ".jpeg", ".png")
+            )
+
+            if not photos:
+                self.error.emit("Nenhuma foto encontrada na pasta.")
+                return
+
+            total = len(photos)
+            renamed = 0
+            errors = 0
+            skipped = 0
+
+            for i, photo in enumerate(photos):
+                if self._cancel:
+                    break
+
+                try:
+                    date_str = self._extract_date_from_image(photo)
+
+                    if date_str is None:
+                        skipped += 1
+                        self.progress.emit(
+                            i + 1, total, f"⚠ Sem data: {photo.name}"
+                        )
+
+                        # Mover para subpasta _nao_identificados
+                        if not self.dry_run:
+                            no_id_dir = self.folder / "_nao_identificados"
+                            no_id_dir.mkdir(exist_ok=True)
+                            photo.rename(no_id_dir / photo.name)
+                        continue
+
+                    new_name = f"{date_str}{photo.suffix.lower()}"
+                    new_path = self.folder / new_name
+
+                    # Evitar sobrescrever
+                    counter = 1
+                    while new_path.exists():
+                        new_name = f"{date_str}_{counter:02d}{photo.suffix.lower()}"
+                        new_path = self.folder / new_name
+                        counter += 1
+
+                    if not self.dry_run:
+                        photo.rename(new_path)
+
+                    renamed += 1
+                    prefix = "[DRY] " if self.dry_run else ""
+                    self.progress.emit(
+                        i + 1, total, f"{prefix}{photo.name} → {new_name}"
+                    )
+
+                except Exception as e:
+                    errors += 1
+                    self.progress.emit(
+                        i + 1, total, f"❌ {photo.name}: {e}"
+                    )
+
+            self.finished.emit(renamed, errors, skipped)
+
+        except Exception as e:
+            self.error.emit(str(e))
+
+
 BUTTON_GREEN = (
     "QPushButton { background-color: #4CAF50; color: white; font-size: 14px; "
     "font-weight: bold; border-radius: 6px; }"
@@ -272,6 +412,13 @@ BUTTON_BLUE = (
     "QPushButton { background-color: #2196F3; color: white; font-size: 14px; "
     "font-weight: bold; border-radius: 6px; }"
     "QPushButton:hover { background-color: #1976D2; }"
+    "QPushButton:disabled { background-color: #ccc; color: #666; }"
+)
+
+BUTTON_ORANGE = (
+    "QPushButton { background-color: #FF9800; color: white; font-size: 14px; "
+    "font-weight: bold; border-radius: 6px; }"
+    "QPushButton:hover { background-color: #F57C00; }"
     "QPushButton:disabled { background-color: #ccc; color: #666; }"
 )
 
@@ -294,8 +441,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("<b>📂 Origem (Cartão SD):</b>"))
         row_src = QHBoxLayout()
         self.src_input = QLineEdit()
-        self.src_input.setPlaceholderText("Selecione o cartão SD...")
-        self.src_input.setReadOnly(True)
+        self.src_input.setPlaceholderText("Cole o caminho ou clique Selecionar...")
         row_src.addWidget(self.src_input)
         btn_src = QPushButton("Selecionar")
         btn_src.clicked.connect(self._select_source)
@@ -306,8 +452,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(QLabel("<b>📁 Destino:</b>"))
         row_dst = QHBoxLayout()
         self.dst_input = QLineEdit()
-        self.dst_input.setPlaceholderText("Selecione a pasta de destino...")
-        self.dst_input.setReadOnly(True)
+        self.dst_input.setPlaceholderText("Cole o caminho ou clique Selecionar...")
         row_dst.addWidget(self.dst_input)
         btn_dst = QPushButton("Selecionar")
         btn_dst.clicked.connect(self._select_destination)
@@ -366,6 +511,38 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(grp_tl)
 
+        # === OCR Rename ===
+        grp_ocr = QGroupBox("🔍 Renomear por OCR (data na foto)")
+        ocr_layout = QVBoxLayout(grp_ocr)
+
+        row_ocr_src = QHBoxLayout()
+        self.ocr_input = QLineEdit()
+        self.ocr_input.setPlaceholderText("Cole o caminho ou clique Selecionar...")
+        row_ocr_src.addWidget(self.ocr_input)
+        btn_ocr_src = QPushButton("Selecionar")
+        btn_ocr_src.clicked.connect(self._select_ocr_folder)
+        row_ocr_src.addWidget(btn_ocr_src)
+        ocr_layout.addLayout(row_ocr_src)
+
+        row_ocr_btn = QHBoxLayout()
+        self.btn_ocr = QPushButton("🔍  Renomear por Data (OCR)")
+        self.btn_ocr.setMinimumHeight(40)
+        self.btn_ocr.setStyleSheet(BUTTON_ORANGE)
+        self.btn_ocr.setEnabled(HAS_OCR)
+        self.btn_ocr.clicked.connect(self._start_ocr_rename)
+        if not HAS_OCR:
+            self.btn_ocr.setToolTip("Instale pytesseract e Pillow para usar OCR")
+        row_ocr_btn.addWidget(self.btn_ocr)
+
+        self.btn_cancel_ocr = QPushButton("⏹  Cancelar")
+        self.btn_cancel_ocr.setMinimumHeight(40)
+        self.btn_cancel_ocr.setEnabled(False)
+        self.btn_cancel_ocr.clicked.connect(self._cancel_task)
+        row_ocr_btn.addWidget(self.btn_cancel_ocr)
+        ocr_layout.addLayout(row_ocr_btn)
+
+        layout.addWidget(grp_ocr)
+
         # === Progresso ===
         self.progress_bar = QProgressBar()
         self.progress_bar.setMinimumHeight(25)
@@ -388,21 +565,93 @@ class MainWindow(QMainWindow):
         lbl_footer.setStyleSheet("color: #999; font-size: 11px; margin-top: 4px;")
         layout.addWidget(lbl_footer)
 
+    def _pick_directory(self, title: str) -> str:
+        """Abre diálogo Qt puro (sem portal nativo) para selecionar pasta."""
+        dlg = QFileDialog(self, title)
+        dlg.setFileMode(QFileDialog.Directory)
+        dlg.setOption(QFileDialog.ShowDirsOnly, True)
+        dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+        if dlg.exec_():
+            dirs = dlg.selectedFiles()
+            if dirs:
+                return dirs[0]
+        return ""
+
     def _select_source(self):
-        path = QFileDialog.getExistingDirectory(self, "Selecionar Cartão SD")
+        path = self._pick_directory("Selecionar Cartão SD")
         if path:
             self.src_input.setText(path)
 
     def _select_destination(self):
-        path = QFileDialog.getExistingDirectory(self, "Selecionar Pasta de Destino")
+        path = self._pick_directory("Selecionar Pasta de Destino")
         if path:
             self.dst_input.setText(path)
+
+    def _select_ocr_folder(self):
+        path = self._pick_directory("Selecionar Pasta com Fotos")
+        if path:
+            self.ocr_input.setText(path)
+
+    def _start_ocr_rename(self):
+        folder = self.ocr_input.text().strip()
+        if not folder:
+            QMessageBox.warning(self, "Atenção", "Selecione a pasta com fotos.")
+            return
+
+        folder_path = Path(folder)
+        if not folder_path.exists():
+            QMessageBox.warning(self, "Erro", "Pasta não encontrada.")
+            return
+
+        photos = [
+            f for f in folder_path.iterdir()
+            if f.is_file() and f.suffix.lower() in (".jpg", ".jpeg", ".png")
+        ]
+        if not photos:
+            QMessageBox.warning(self, "Atenção", "Nenhuma foto encontrada na pasta.")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Confirmar OCR Rename",
+            f"Renomear {len(photos)} fotos baseado na data detectada por OCR?\n\n"
+            f"Fotos sem data legível serão movidas para '_nao_identificados/'.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._set_buttons_busy(True)
+        self.log.clear()
+        self.progress_bar.setValue(0)
+        self.lbl_status.setText("Iniciando OCR...")
+
+        self.worker = OcrRenameWorker(folder_path)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.finished.connect(self._on_ocr_finished)
+        self.worker.error.connect(self._on_error)
+
+        self.thread = threading.Thread(target=self.worker.run, daemon=True)
+        self.thread.start()
+
+    def _on_ocr_finished(self, renamed: int, errors: int, skipped: int):
+        self._set_buttons_busy(False)
+        msg = f"✅ OCR concluído! {renamed} renomeadas"
+        if skipped:
+            msg += f", {skipped} sem data (movidas para _nao_identificados)"
+        if errors:
+            msg += f", {errors} erros"
+        self.lbl_status.setText(msg)
+        self.log.append(f"\n{msg}")
+        QMessageBox.information(self, "OCR Concluído", msg)
 
     def _set_buttons_busy(self, busy: bool):
         self.btn_copy.setEnabled(not busy)
         self.btn_timelapse.setEnabled(not busy)
+        self.btn_ocr.setEnabled(not busy and HAS_OCR)
         self.btn_cancel_copy.setEnabled(busy)
         self.btn_cancel_tl.setEnabled(busy)
+        self.btn_cancel_ocr.setEnabled(busy)
 
     def _start_copy(self):
         src = self.src_input.text().strip()
