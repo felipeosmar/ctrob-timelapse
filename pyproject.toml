@@ -1,16 +1,16 @@
 [project]
 name = "ctrob-timelapse"
-version = "1.0.0"
-description = "Organizador de fotos timelapse de cartão SD"
+version = "2.0.0"
+description = "Organizador de fotos timelapse de cartão SD com OCR"
 requires-python = ">=3.10"
 dependencies = [
     "PyQt5>=5.15",
     "Pillow>=10.0",
     "easyocr>=1.7",
+    "pytesseract>=0.3",
+    "numpy>=1.24",
+    "scipy>=1.10",
 ]
-
-[project.optional-dependencies]
-tesseract = ["pytesseract>=0.3"]
 
 [project.scripts]
 ctrob-timelapse = "main:main"

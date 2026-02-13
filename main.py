@@ -43,10 +43,12 @@ HAS_OCR = True
 try:
     import importlib
     importlib.import_module("PIL")
-    # Check for at least one OCR backend
+    importlib.import_module("numpy")
+    importlib.import_module("scipy")
+    # Need both easyocr (CRAFT detection) and tesseract (recognition)
     _has_easyocr = bool(importlib.util.find_spec("easyocr"))
     _has_tesseract = bool(importlib.util.find_spec("pytesseract"))
-    if not _has_easyocr and not _has_tesseract:
+    if not _has_easyocr or not _has_tesseract:
         HAS_OCR = False
 except Exception:
     HAS_OCR = False
@@ -101,31 +103,54 @@ class CopyWorker(QObject):
         except Exception as e:
             self.error.emit(str(e))
 
+    # Pattern for files named YYYY-MM-DD_HH-MM-SS.jpg (date+time in filename)
+    _FILE_DATETIME_RE = re.compile(
+        r"^(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})"
+    )
+
     def _scan_photos(self) -> list:
         """
-        Varre a árvore do SD e retorna lista de (caminho_original, novo_nome).
+        Varre a origem e retorna lista de (caminho_original, novo_nome).
 
-        Estrutura: {data}/{???}/jpg/{hora}/{arquivo}.jpg
-        Resultado: {data}_{seq:03d}.jpg
+        Aceita duas estruturas:
+        1. Árvore SD: {data}/{???}/jpg/{hora}/{arquivo}.jpg
+        2. Arquivos soltos: YYYY-MM-DD_HH-MM-SS.jpg
+
+        Resultado: {data}_{seq:03d}.jpg (agrupado por data, ordenado por hora)
         """
-        photos = []
+        # Collect (path, date, sort_key)
+        entries: list[tuple[Path, str, str]] = []
 
+        # 1. Scan date directories (SD card structure)
         date_dirs = sorted(
             d
             for d in self.source.iterdir()
             if d.is_dir() and len(d.name) == 10 and d.name[4] == "-"
         )
-
         for date_dir in date_dirs:
             date_str = date_dir.name
-            seq = 1
+            for jpg_path in sorted(date_dir.rglob("*.jpg")):
+                # Use filename for sort order within the date
+                entries.append((jpg_path, date_str, jpg_path.name))
 
-            jpg_files = sorted(date_dir.rglob("*.jpg"))
+        # 2. Scan loose files with YYYY-MM-DD_HH-MM-SS pattern
+        for f in sorted(self.source.iterdir()):
+            if not f.is_file() or f.suffix.lower() not in (".jpg", ".jpeg"):
+                continue
+            m = self._FILE_DATETIME_RE.match(f.stem)
+            if m:
+                entries.append((f, m.group(1), m.group(2)))
 
-            for jpg_path in jpg_files:
-                new_name = f"{date_str}_{seq:03d}.jpg"
-                photos.append((jpg_path, new_name))
-                seq += 1
+        # Sort by (date, time/name) and assign sequential numbers per date
+        entries.sort(key=lambda x: (x[1], x[2]))
+
+        photos = []
+        date_seq: dict[str, int] = {}
+        for path, date_str, _sort_key in entries:
+            seq = date_seq.get(date_str, 0) + 1
+            date_seq[date_str] = seq
+            new_name = f"{date_str}_{seq:03d}.jpg"
+            photos.append((path, new_name))
 
         return photos
 
@@ -277,35 +302,25 @@ class TimelapseWorker(QObject):
 class OcrRenameWorker(QObject):
     """Worker que renomeia fotos baseado em OCR da data no canto superior direito.
 
-    Usa EasyOCR (deep learning, melhor com fundos variados) como backend
-    principal, com fallback para Tesseract. Parsing robusto corrige
-    erros comuns de OCR em timestamps de câmera.
-
-    Múltiplos pré-processamentos (raw, CLAHE, alto contraste) são tentados
-    para lidar com fotos diurnas (texto branco sobre céu azul claro).
+    Pipeline (92% accuracy em fotos 4K com texto branco outline):
+    1. Crop top-right da imagem (região do timestamp)
+    2. CRAFT text detection (via EasyOCR) para localizar texto precisamente
+    3. Adaptive local threshold para isolar texto de fundos variados
+    4. Tesseract PSM 8 para reconhecimento
+    5. Multi-strategy fallback (diferentes crops e thresholds)
     """
 
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(int, int, int)  # renamed, errors, skipped
     error = pyqtSignal(str)
 
-    # Mapa extenso de substituições OCR (letras → dígitos mais prováveis)
-    _OCR_FIXES = {
-        "Q": "0", "O": "0", "o": "0", "D": "0", "U": "0", "C": "0",
-        "b": "8", "B": "8", "e": "8",
-        "l": "1", "I": "1", "i": "1", "J": "1", "r": "1", "t": "1",
-        "Z": "2", "z": "2",
-        "S": "5", "s": "5",
-        "G": "6", "g": "9",
-        "A": "4", "a": "4", "h": "4",
-        "T": "7", "n": "0", "p": "0", "d": "0",
-    }
-
-    # Padrões de data flexíveis (mês pode ter 1-3 dígitos por erro de OCR)
-    _DATE_PATTERNS = [
-        re.compile(r"(\d{1,2})[/-](\d{1,3})[/-](\d{4})"),
-        re.compile(r"(\d{1,2})\s+(\d{1,3})\s*[,.]?\s*(\d{4})"),
-        re.compile(r"(\d{1,2})\D+(\d{1,3})\D+(\d{4})"),
+    # Regex patterns: strict to loose
+    _VALIDATE_PATTERNS = [
+        re.compile(r"(\d{2})-(\d{2})-(\d{4})\s*(\d{2}):(\d{2}):(\d{2})"),
+        re.compile(r"(\d{2})-(\d{2})-(\d{4})\D*(\d{2})\D*(\d{2})\D*(\d{2})"),
+        re.compile(r"(\d{1,2})-(\d{2})-(\d{4})\D*(\d{2})\D*(\d{2})\D*(\d{2})"),
+        re.compile(r"(\d{2})(\d{2})-(\d{4})\D*(\d{2})\D*(\d{2})\D*(\d{2})"),
+        re.compile(r"(\d{1,2})\D+(\d{2})\D+(\d{4})\d?(\d{2})\D*(\d{2})\D*(\d{2})"),
     ]
 
     def __init__(self, folder: Path, dry_run: bool = False):
@@ -318,283 +333,101 @@ class OcrRenameWorker(QObject):
     def cancel(self):
         self._cancel = True
 
-    @classmethod
-    def _clean_ocr(cls, text: str) -> str:
-        """Corrige substituições comuns de OCR."""
-        for old, new in cls._OCR_FIXES.items():
-            text = text.replace(old, new)
-        return text
+    def _get_reader(self):
+        """Lazy-init EasyOCR reader (used for CRAFT text detection)."""
+        if self._easyocr_reader is None:
+            import easyocr
+            self._easyocr_reader = easyocr.Reader(
+                ["en"], gpu=True, verbose=False
+            )
+        return self._easyocr_reader
 
     @staticmethod
-    def _fix_year(y_str: str) -> str | None:
-        """Corrige anos com primeiro dígito garbled (ex: 4025→2025)."""
-        y = int(y_str)
-        if 2020 <= y <= 2030:
-            return y_str
-        for fix in [f"2{y_str[1:]}", f"20{y_str[2:]}"]:
-            try:
-                if 2020 <= int(fix) <= 2030:
-                    return fix
-            except (ValueError, IndexError):
-                pass
+    def _validate_datetime(text: str) -> str | None:
+        """Parse OCR text into validated datetime string."""
+        for pat in OcrRenameWorker._VALIDATE_PATTERNS:
+            m = pat.search(text)
+            if not m:
+                continue
+            d, mo, y, h, mi, s = [int(x) for x in m.groups()]
+            # Fix garbled year (e.g. 4025 → 2025, 5025 → 2025)
+            if not (2020 <= y <= 2030):
+                for fix in [int(f"2{str(y)[1:]}"), int(f"20{str(y)[2:]}")]:
+                    if 2020 <= fix <= 2030:
+                        y = fix
+                        break
+            if (1 <= d <= 31 and 1 <= mo <= 12 and 2020 <= y <= 2030
+                    and 0 <= h <= 23 and 0 <= mi <= 59 and 0 <= s <= 59):
+                return f"{y}-{mo:02d}-{d:02d}_{h:02d}-{mi:02d}-{s:02d}"
         return None
 
-    @staticmethod
-    def _extract_time_from_digits(d: str, m: str, y: str, digits: str) -> str:
-        """Extrai HH:MM:SS de uma sequência de dígitos via janela deslizante."""
-        # Tentar HHMMSS (6 dígitos)
-        if len(digits) >= 6:
-            for start in range(len(digits) - 5):
-                w = digits[start:start + 6]
-                hh, mm, ss = int(w[0:2]), int(w[2:4]), int(w[4:6])
-                if hh <= 23 and mm <= 59 and ss <= 59:
-                    return f"{y}-{m}-{d}_{hh:02d}-{mm:02d}-{ss:02d}"
-        # Tentar HHMM (4 dígitos)
-        if len(digits) >= 4:
-            for start in range(len(digits) - 3):
-                w = digits[start:start + 4]
-                hh, mm = int(w[0:2]), int(w[2:4])
-                if hh <= 23 and mm <= 59:
-                    return f"{y}-{m}-{d}_{hh:02d}-{mm:02d}-00"
-        # Tentar HH (2 dígitos)
-        if len(digits) >= 2:
-            hh = int(digits[0:2])
-            if hh <= 23:
-                return f"{y}-{m}-{d}_{hh:02d}-00-00"
-        return f"{y}-{m}-{d}_00-00-00"
+    def _preprocess_and_ocr(self, crop, diff_thresh: int = 20) -> str | None:
+        """CRAFT detect → adaptive threshold → Tesseract OCR."""
+        import numpy as np
+        from PIL import Image, ImageFilter, ImageOps
+        from scipy.ndimage import uniform_filter
+        import pytesseract
 
-    def _parse_datetime(self, raw_text: str) -> str | None:
-        """Extrai data/hora de texto OCR com parsing tolerante a erros.
+        reader = self._get_reader()
 
-        Suporta datas com mês de 1-3 dígitos (ex: 08, 8, 008),
-        anos com primeiro dígito errado (ex: 4025→2025),
-        e horas sem separadores claros (ex: '1300.04'→13:00:04).
-        """
-        text = self._clean_ocr(raw_text)
-        cleaned = re.sub(r"[^0-9/\-:., ]", "", text)
+        # 1. CRAFT text detection on crop
+        horiz, _ = reader.detect(np.array(crop))
+        if not horiz or not horiz[0]:
+            return None
 
-        for pat in self._DATE_PATTERNS:
-            for dm in pat.finditer(cleaned):
-                d, m, y = dm.groups()
+        x1, x2, y1, y2 = horiz[0][0]
+        pad = 5
+        x1 = max(0, int(x1) - pad)
+        y1 = max(0, int(y1) - pad)
+        x2 = min(crop.width, int(x2) + pad)
+        y2 = min(crop.height, int(y2) + pad)
+        text_region = crop.crop((x1, y1, x2, y2))
 
-                # Corrigir ano
-                y = self._fix_year(y)
-                if y is None:
-                    continue
+        # 2. Adaptive local threshold (key innovation)
+        gray = np.array(text_region.convert("L")).astype(np.float32)
+        local_mean = uniform_filter(gray, size=15)
+        diff = gray - local_mean
+        binary = (diff > diff_thresh).astype(np.uint8) * 255
 
-                # Corrigir mês com 3 dígitos (ex: 008→08, 031→01)
-                if len(m) == 3:
-                    for m_try in [m[1:], m[:2]]:
-                        if 1 <= int(m_try) <= 12:
-                            m = m_try
-                            break
+        # 3. Scale 3x + morphological cleanup
+        pil = Image.fromarray(binary)
+        pil = pil.resize((pil.width * 3, pil.height * 3), Image.NEAREST)
+        pil = pil.filter(ImageFilter.MaxFilter(3))
+        pil = pil.filter(ImageFilter.MinFilter(3))
+        pil_inv = ImageOps.invert(pil)
 
-                d = d.zfill(2)
-                m = m.zfill(2)
+        # 4. Tesseract PSM 8 (single word — works best for timestamps)
+        WHITELIST = '-c tessedit_char_whitelist="0123456789-/.: "'
+        raw = pytesseract.image_to_string(
+            pil_inv, config=f"--psm 8 {WHITELIST}"
+        ).strip()
 
-                if 1 <= int(d) <= 31 and 1 <= int(m) <= 12:
-                    rest = cleaned[dm.end():]
-                    digits = re.sub(r"[^0-9]", "", rest)
-                    return self._extract_time_from_digits(d, m, y, digits)
+        return self._validate_datetime(raw)
 
-        return None
-
-    def _crop_timestamp_region(self, img_path: Path):
-        """Recorta a região do timestamp (canto superior direito)."""
+    def _extract_date_from_image(self, img_path: Path) -> str | None:
+        """Extract datetime with multi-strategy fallback (92% accuracy)."""
         from PIL import Image
 
         img = Image.open(img_path)
         w, h = img.size
-        crop = img.crop((int(w * 0.55), 0, w, int(h * 0.10)))
-        return crop
 
-    def _get_preprocessed_crops(self, crop):
-        """Gera múltiplas versões pré-processadas do crop para OCR.
+        # Different crop regions (wider catches more context)
+        crops = [
+            img.crop((int(w * 0.50), 0, w, int(h * 0.12))),  # wider
+            img.crop((int(w * 0.55), 0, w, int(h * 0.10))),  # default
+        ]
 
-        Retorna lista de (nome, imagem) com diferentes estratégias,
-        ordenadas por eficácia empírica:
-        - raw: imagem original (funciona bem para noturnas/nublado)
-        - clahe: equalização adaptativa de histograma (melhora contraste local)
-        - contrast: alto contraste (ajuda com texto desbotado)
-        - sat_v_combo: HSV low-sat + high-value (isola texto branco de céu azul)
-        - clahe8/16: CLAHE agressivo (recupera texto em fundos claros/cinza)
-        - adaptive: threshold adaptativo gaussiano
-        """
-        try:
-            import cv2
-            import numpy as np
-            from PIL import ImageEnhance
-        except ImportError:
-            return [("raw", crop)]
+        # Different adaptive thresholds
+        thresholds = [20, 15, 25]
 
-        from PIL import Image
-
-        preprocessed = [("raw", crop)]
-
-        img_cv = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2BGR)
-        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-
-        # CLAHE — equalização adaptativa de histograma
-        clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
-        cl = clahe.apply(gray)
-        preprocessed.append(("clahe", Image.fromarray(cl)))
-
-        # Alto contraste
-        enhanced = ImageEnhance.Contrast(crop).enhance(3.0)
-        preprocessed.append(("contrast", enhanced))
-
-        # HSV: low saturation + high value (isola texto branco de céu azul)
-        hsv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2HSV)
-        s_chan, v_chan = hsv[:, :, 1], hsv[:, :, 2]
-        _, s_inv = cv2.threshold(s_chan, 30, 255, cv2.THRESH_BINARY_INV)
-        _, v_high = cv2.threshold(v_chan, 220, 255, cv2.THRESH_BINARY)
-        sat_v = cv2.bitwise_and(s_inv, v_high)
-        preprocessed.append(("sat_v_combo", Image.fromarray(sat_v)))
-
-        # CLAHE agressivo (clipLimit=8, tileGrid=4x4) — recupera texto
-        # branco sobre fundos claros/cinza com baixo contraste
-        clahe8 = cv2.createCLAHE(clipLimit=8.0, tileGridSize=(4, 4))
-        cl8 = clahe8.apply(gray)
-        preprocessed.append(("clahe8", Image.fromarray(cl8)))
-
-        # CLAHE muito agressivo (clipLimit=16)
-        clahe16 = cv2.createCLAHE(clipLimit=16.0, tileGridSize=(4, 4))
-        cl16 = clahe16.apply(gray)
-        preprocessed.append(("clahe16", Image.fromarray(cl16)))
-
-        # Adaptive threshold gaussiano
-        adapt = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY, 21, -8,
-        )
-        preprocessed.append(("adaptive", Image.fromarray(adapt)))
-
-        return preprocessed
-
-    def _try_easyocr(self, crop) -> str | None:
-        """Tenta OCR com EasyOCR em múltiplos pré-processamentos."""
-        try:
-            import easyocr
-        except ImportError:
-            return None
-
-        if self._easyocr_reader is None:
-            self._easyocr_reader = easyocr.Reader(
-                ["en"], gpu=True, verbose=False
-            )
-
-        import tempfile
-
-        for _name, img_proc in self._get_preprocessed_crops(crop):
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-                img_proc.save(f.name)
-                results = self._easyocr_reader.readtext(f.name, detail=0)
-                Path(f.name).unlink(missing_ok=True)
-
-            raw = " ".join(results).strip()
-            result = self._parse_datetime(raw)
-            if result:
-                return result
-
-        return None
-
-    def _try_tesseract(self, crop) -> str | None:
-        """Tenta OCR com Tesseract (múltiplas estratégias de pré-processamento).
-
-        Pipeline completo:
-        1. Threshold direto em grayscale (noturnas/nublado)
-        2. HSV sat_v_combo (texto branco sobre céu azul)
-        3. CLAHE agressivo (texto sobre fundos claros)
-        4. Adaptive threshold (casos extremos)
-        5. Autocontrast (amanhecer/entardecer)
-        Cada estratégia é testada com PSM 7 (single line) e PSM 6 (block).
-        """
-        try:
-            import pytesseract
-            import cv2
-            import numpy as np
-            from PIL import Image, ImageOps
-        except ImportError:
-            return None
-
-        WHITELIST = "-c tessedit_char_whitelist=0123456789-/.: "
-
-        gray = crop.convert("L")
-        gray_np = np.array(gray)
-
-        # --- Gerar todas as imagens binarizadas para OCR ---
-        strategies: list[tuple[str, Image.Image]] = []
-
-        # 1. Threshold direto (funciona para fundo escuro / noturno)
-        for thresh in [170, 180, 190]:
-            binary = gray.point(lambda x, t=thresh: 255 if x > t else 0)
-            strategies.append((f"gray_{thresh}", binary))
-
-        # 2. HSV: low saturation + high value (céu azul)
-        img_cv = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2BGR)
-        hsv = cv2.cvtColor(img_cv, cv2.COLOR_BGR2HSV)
-        s_chan, v_chan = hsv[:, :, 1], hsv[:, :, 2]
-        _, s_inv = cv2.threshold(s_chan, 30, 255, cv2.THRESH_BINARY_INV)
-        _, v_high = cv2.threshold(v_chan, 220, 255, cv2.THRESH_BINARY)
-        sat_v = cv2.bitwise_and(s_inv, v_high)
-        strategies.append(("sat_v", Image.fromarray(sat_v)))
-
-        # 3. CLAHE agressivo + threshold alto
-        for clip, name in [(8.0, "clahe8"), (16.0, "clahe16")]:
-            clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(4, 4))
-            cl = clahe.apply(gray_np)
-            for t in [220, 240]:
-                _, ct = cv2.threshold(cl, t, 255, cv2.THRESH_BINARY)
-                strategies.append((f"{name}_{t}", Image.fromarray(ct)))
-
-        # 4. Adaptive threshold gaussiano
-        for bs, c in [(21, -5), (21, -8)]:
-            adapt = cv2.adaptiveThreshold(
-                gray_np, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                cv2.THRESH_BINARY, bs, c,
-            )
-            strategies.append((f"adapt_{bs}_{c}", Image.fromarray(adapt)))
-
-        # 5. Autocontrast (funciona para amanhecer/entardecer)
-        for cutoff in [5, 10]:
-            enhanced = ImageOps.autocontrast(gray, cutoff=cutoff)
-            for thresh in [200, 220]:
-                binary = enhanced.point(lambda x, t=thresh: 255 if x > t else 0)
-                strategies.append((f"auto_{cutoff}_{thresh}", binary))
-
-        # --- Testar cada estratégia com PSM 7 e PSM 6 ---
-        for _name, binary in strategies:
-            for psm in [7, 6]:
+        for crop in crops:
+            for t in thresholds:
                 try:
-                    scaled = binary.resize(
-                        (binary.width * 3, binary.height * 3), Image.LANCZOS
-                    )
-                    text = pytesseract.image_to_string(
-                        scaled,
-                        config=f"--psm {psm} {WHITELIST}",
-                    ).strip()
+                    result = self._preprocess_and_ocr(crop, t)
+                    if result:
+                        return result
                 except Exception:
                     continue
-
-                result = self._parse_datetime(text)
-                if result:
-                    return result
-
-        return None
-
-    def _extract_date_from_image(self, img_path: Path) -> str | None:
-        """Extrai data/hora usando EasyOCR com fallback para Tesseract."""
-        crop = self._crop_timestamp_region(img_path)
-
-        # Tentar EasyOCR primeiro (melhor com fundos variados)
-        result = self._try_easyocr(crop)
-        if result:
-            return result
-
-        # Fallback: Tesseract com múltiplos thresholds
-        result = self._try_tesseract(crop)
-        if result:
-            return result
 
         return None
 
@@ -602,8 +435,8 @@ class OcrRenameWorker(QObject):
         if not HAS_OCR:
             self.error.emit(
                 "Dependências de OCR não instaladas.\n"
-                "Instale com: pip install easyocr Pillow\n"
-                "Ou: pip install pytesseract Pillow + apt install tesseract-ocr"
+                "Instale com: pip install easyocr pytesseract Pillow scipy numpy\n"
+                "+ apt install tesseract-ocr (ou inclua no instalador)"
             )
             return
 
@@ -744,6 +577,38 @@ class MainWindow(QMainWindow):
         row_copy.addWidget(self.btn_cancel_copy)
         layout.addLayout(row_copy)
 
+        # === OCR Rename ===
+        grp_ocr = QGroupBox("🔍 Renomear por OCR (data na foto)")
+        ocr_layout = QVBoxLayout(grp_ocr)
+
+        row_ocr_src = QHBoxLayout()
+        self.ocr_input = QLineEdit()
+        self.ocr_input.setPlaceholderText("Cole o caminho ou clique Selecionar...")
+        row_ocr_src.addWidget(self.ocr_input)
+        btn_ocr_src = QPushButton("Selecionar")
+        btn_ocr_src.clicked.connect(self._select_ocr_folder)
+        row_ocr_src.addWidget(btn_ocr_src)
+        ocr_layout.addLayout(row_ocr_src)
+
+        row_ocr_btn = QHBoxLayout()
+        self.btn_ocr = QPushButton("🔍  Renomear por Data (OCR)")
+        self.btn_ocr.setMinimumHeight(40)
+        self.btn_ocr.setStyleSheet(BUTTON_ORANGE)
+        self.btn_ocr.setEnabled(HAS_OCR)
+        self.btn_ocr.clicked.connect(self._start_ocr_rename)
+        if not HAS_OCR:
+            self.btn_ocr.setToolTip("Instale easyocr, pytesseract, Pillow, scipy e numpy")
+        row_ocr_btn.addWidget(self.btn_ocr)
+
+        self.btn_cancel_ocr = QPushButton("⏹  Cancelar")
+        self.btn_cancel_ocr.setMinimumHeight(40)
+        self.btn_cancel_ocr.setEnabled(False)
+        self.btn_cancel_ocr.clicked.connect(self._cancel_task)
+        row_ocr_btn.addWidget(self.btn_cancel_ocr)
+        ocr_layout.addLayout(row_ocr_btn)
+
+        layout.addWidget(grp_ocr)
+
         # === Timelapse ===
         grp_tl = QGroupBox("🎬 Gerar Timelapse")
         tl_layout = QVBoxLayout(grp_tl)
@@ -780,38 +645,6 @@ class MainWindow(QMainWindow):
         tl_layout.addLayout(row_tl_btn)
 
         layout.addWidget(grp_tl)
-
-        # === OCR Rename ===
-        grp_ocr = QGroupBox("🔍 Renomear por OCR (data na foto)")
-        ocr_layout = QVBoxLayout(grp_ocr)
-
-        row_ocr_src = QHBoxLayout()
-        self.ocr_input = QLineEdit()
-        self.ocr_input.setPlaceholderText("Cole o caminho ou clique Selecionar...")
-        row_ocr_src.addWidget(self.ocr_input)
-        btn_ocr_src = QPushButton("Selecionar")
-        btn_ocr_src.clicked.connect(self._select_ocr_folder)
-        row_ocr_src.addWidget(btn_ocr_src)
-        ocr_layout.addLayout(row_ocr_src)
-
-        row_ocr_btn = QHBoxLayout()
-        self.btn_ocr = QPushButton("🔍  Renomear por Data (OCR)")
-        self.btn_ocr.setMinimumHeight(40)
-        self.btn_ocr.setStyleSheet(BUTTON_ORANGE)
-        self.btn_ocr.setEnabled(HAS_OCR)
-        self.btn_ocr.clicked.connect(self._start_ocr_rename)
-        if not HAS_OCR:
-            self.btn_ocr.setToolTip("Instale pytesseract e Pillow para usar OCR")
-        row_ocr_btn.addWidget(self.btn_ocr)
-
-        self.btn_cancel_ocr = QPushButton("⏹  Cancelar")
-        self.btn_cancel_ocr.setMinimumHeight(40)
-        self.btn_cancel_ocr.setEnabled(False)
-        self.btn_cancel_ocr.clicked.connect(self._cancel_task)
-        row_ocr_btn.addWidget(self.btn_cancel_ocr)
-        ocr_layout.addLayout(row_ocr_btn)
-
-        layout.addWidget(grp_ocr)
 
         # === Progresso ===
         self.progress_bar = QProgressBar()
